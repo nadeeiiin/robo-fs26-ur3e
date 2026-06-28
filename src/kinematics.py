@@ -13,15 +13,14 @@ from urdf_parser_py.urdf import URDF
 
 class Kinematics:
     """
-    Unified kinematics class combining:
-    - Correct FK with fixed joints traversal (from kinematics-3.py)
-    - Mathematically sound 6D IK with scipy Rotation error (from kinematics-3.py)
-    - Dynamic pick/place coordinates as arguments (from kinematics.py / kinematics_pointed.py)
-    - Adaptive step size and stall detection for robust convergence (from kinematics.py)
-    - Chained IK seeds: each waypoint uses previous solution as seed (from kinematics.py)
+    UR3e kinematics for pick and place.
+    
+    Provides forward kinematics (joint angles to end-effector pose) and inverse
+    kinematics (target pose to joint angles), and derives all motion-sequence
+    waypoints with their joint angles from the pick and place coordinates.
     """
 
-    # Home pose — upright, The sequence starts and ends here.
+    # Home pose upright, The sequence starts and ends here.
     HOME_RAD = np.array([0.0, -1.57, 0.0, 0.0, 0.0, 0.0])
 
     # Safe start pose — verified teach-pendant pose with the gripper pointing
@@ -30,10 +29,8 @@ class Kinematics:
     SAFE_START_DEG = np.array([79.94, -88.37, 0.13, -2.21, -89.37, 351.79])
 
     # --- Height calibration (measured on the real robot) ---
-    # Single measured height offset between the code's zero and the desired grasp
-    # height. It combines the table height and the tool0->tip distance into one
-    # neutral constant (measured: the gripper tip touches the table at 215 mm).
-    Z_OFFSET = 0.215        # m
+    # Single measured height offset between the code's zero and the desired grasp height
+    Z_OFFSET = 0.215 # m
 
     # Approach offset above the object top
     APPROACH_OFFSET = 0.05  # m
@@ -46,10 +43,6 @@ class Kinematics:
         self.transform_broadcaster = tf2_ros.TransformBroadcaster()
         self.rate = rospy.Rate(10)
         rospy.sleep(1.0)
-
-    # ------------------------------------------------------------------
-    # Public entry point
-    # ------------------------------------------------------------------
 
     def run(self, pick_x, pick_y, place_x, place_y, object_height, gripper_width_mm):
         """
@@ -67,60 +60,56 @@ class Kinematics:
         dict with keys: home, start, pick_approach, pick, pick_retreat,
                         place_approach, place, place_retreat
         """
-        robot       = URDF.from_parameter_server()
-        root        = robot.get_root()
+        robot = URDF.from_parameter_server()
+        root = robot.get_root()
         joint_names = robot.get_chain(root, "tool0", joints=True, links=False, fixed=False)
 
-        # --- Home pose (very start & very end of the sequence): upright ---
+        # Home pose (very start & very end of the sequence)
         q_home = self.HOME_RAD.copy()
 
-        # --- Safe start pose (gripper straight down): reached right after home ---
+        # Safe start pose (gripper straight down): reached right after home
         # The grasp orientation for every pick/place waypoint is taken from here.
-        q_start   = np.deg2rad(self.SAFE_START_DEG)
-        # Unwrap each joint to the shortest path from home. Without this, e.g.
-        # wrist3 = 351.79 deg would spin ~+352 deg from home's 0 deg, instead of
-        # the equivalent -8.21 deg — which made the arm hang high and crank the
-        # wrist around until the gripper hit the arm.
-        q_start   = self._unwrap_to_seed(q_start, q_home)
-        T_start   = self.calculate_forward_kinematics(q_start, joint_names, robot)
+        q_start = np.deg2rad(self.SAFE_START_DEG)
+        
+        # Unwrap each joint to the shortest path from home
+        q_start = self._unwrap_to_seed(q_start, q_home)
+        T_start = self.calculate_forward_kinematics(q_start, joint_names, robot)
         grasp_rot = Rotation.from_matrix(T_start[:3, :3])
         rospy.loginfo("Home (upright): %s", np.round(np.rad2deg(q_home), 1))
         rospy.loginfo("Safe start (unwrapped): %s", np.round(np.rad2deg(q_start), 1))
         rospy.loginfo("Safe start FK: pos=(%.1f, %.1f, %.1f) mm",
                       T_start[0,3]*1000, T_start[1,3]*1000, T_start[2,3]*1000)
 
-        # --- Derive waypoint Cartesian poses ---
-        # Heights use a single measured offset (Z_OFFSET): the grasp tip sits at
-        # the object's mid-height, the approach APPROACH_OFFSET above the top.
-        #   grasp_z = Z_OFFSET + object_height/2
-        #   above_z = Z_OFFSET + object_height + APPROACH_OFFSET
+        # Derive waypoint Cartesian poses 
+        # grasp_z = Z_OFFSET + object_height/2
+        # above_z = Z_OFFSET + object_height + APPROACH_OFFSET
         grasp_z  = self.Z_OFFSET + object_height / 2.0
         above_z  = self.Z_OFFSET + object_height + self.APPROACH_OFFSET
 
         # Pick poses (orientation = same as start → gripper pointing down)
         pick_approach_pos = np.array([pick_x,  pick_y,  above_z])
-        pick_pos          = np.array([pick_x,  pick_y,  grasp_z])
+        pick_pos = np.array([pick_x,  pick_y,  grasp_z])
 
         # Place poses
         place_approach_pos = np.array([place_x, place_y, above_z])
-        place_pos          = np.array([place_x, place_y, grasp_z])
+        place_pos = np.array([place_x, place_y, grasp_z])
 
         # Place retreat: slightly toward the safe-start pose in XY, same height as approach
         dir_xy = np.array([T_start[0,3] - place_x, T_start[1,3] - place_y])
-        dist   = np.linalg.norm(dir_xy)
+        dist = np.linalg.norm(dir_xy)
         retreat_offset = (dir_xy / dist * 0.03) if dist > 0.001 else np.zeros(2)
         place_retreat_pos = np.array([place_x + retreat_offset[0],
                                       place_y + retreat_offset[1],
                                       above_z])
 
-        # --- Solve IK for each waypoint (chained seeds) ---
+        # Solve IK for each waypoint (chained seeds)
         waypoints = {}
-        waypoints['home']  = q_home    # upright — very first and very last move
-        waypoints['start'] = q_start   # safe gripper-down pose
+        waypoints['home']  = q_home  # upright — very first and very last move
+        waypoints['start'] = q_start # safe gripper-down pose
 
         configs = [
             ('pick_approach',  pick_approach_pos,  grasp_rot,   q_start),
-            ('pick',           pick_pos,            grasp_rot,   None),     # seed = previous
+            ('pick',           pick_pos,            grasp_rot,   None),     
             ('pick_retreat',   pick_approach_pos,   grasp_rot,   None),
             ('place_approach', place_approach_pos,  grasp_rot,   None),
             ('place',          place_pos,           grasp_rot,   None),
@@ -137,9 +126,6 @@ class Kinematics:
                 rospy.logerr("IK failed for waypoint: %s", name)
                 return None
             # Unwrap angles to take shortest path from previous configuration.
-            # Without this, a joint that is e.g. at -170° in q_seed can land at
-            # +170° in q — a 340° rotation — even though -190° (≡ +170°) would
-            # only require 20°.  We correct any joint that is more than π away.
             q = self._unwrap_to_seed(q, q_seed)
             waypoints[name] = q
             prev_q = q
@@ -147,23 +133,20 @@ class Kinematics:
         rospy.loginfo("All waypoints computed successfully.")
         return waypoints
 
-    # ------------------------------------------------------------------
-    # Forward kinematics  (traverses fixed joints too — correct for UR3e)
-    # ------------------------------------------------------------------
-
+    # Forward kinematics
     def _fk_raw(self, joint_positions, joint_names, robot):
         """Forward kinematics in the raw URDF (base_link) frame."""
-        root           = robot.get_root()
+        root = robot.get_root()
         all_joint_names = robot.get_chain(root, "tool0", joints=True, links=False, fixed=True)
 
-        T            = np.eye(4)
+        T = np.eye(4)
         revolute_idx = 0
 
         for jname in all_joint_names:
             joint = robot.joint_map[jname]
-            xyz   = joint.origin.xyz if joint.origin else [0, 0, 0]
-            rpy   = joint.origin.rpy if joint.origin else [0, 0, 0]
-            T     = T @ self._transformation_matrix(xyz, rpy)
+            xyz = joint.origin.xyz if joint.origin else [0, 0, 0]
+            rpy = joint.origin.rpy if joint.origin else [0, 0, 0]
+            T = T @ self._transformation_matrix(xyz, rpy)
 
             if joint.type in ('revolute', 'continuous'):
                 axis  = joint.axis if joint.axis is not None else [0, 0, 1]
@@ -174,15 +157,12 @@ class Kinematics:
         return T
 
     def calculate_forward_kinematics(self, joint_positions, joint_names, robot):
-        """FK in the UR base frame: the URDF base_link -> tool0 chain product.
-        On this robot the URDF frame already matches the controller frame, so
-        no extra correction is applied."""
+        """
+        FK in the UR base frame: the URDF base_link -> tool0 chain product.
+        """
         return self._fk_raw(joint_positions, joint_names, robot)
 
-    # ------------------------------------------------------------------
     # Inverse kinematics  (Newton with scipy Rotation error + adaptive step)
-    # ------------------------------------------------------------------
-
     def inverse_kinematics(self, target_pos, target_rot, q_init, joint_names, robot,
                            max_iterations=500, tolerance=5e-3):
         """
@@ -192,14 +172,14 @@ class Kinematics:
         - Adaptive step size to avoid overshooting
         - Stall detection
         """
-        q          = q_init.copy()
-        damping    = 0.05
+        q = q_init.copy()
+        damping = 0.05
         prev_error = float('inf')
-        stall_cnt  = 0
+        stall_cnt = 0
 
         for i in range(max_iterations):
-            T          = self.calculate_forward_kinematics(q, joint_names, robot)
-            error      = self._compute_error(T, target_pos, target_rot)
+            T = self.calculate_forward_kinematics(q, joint_names, robot)
+            error = self._compute_error(T, target_pos, target_rot)
             pos_error  = np.linalg.norm(error[:3])
 
             if i % 50 == 0:
@@ -223,12 +203,12 @@ class Kinematics:
             J = self._numerical_jacobian(q, target_pos, target_rot, joint_names, robot)
 
             # Damped least squares
-            JtJ         = J.T @ J
-            delta_q     = np.linalg.solve(JtJ + damping * np.eye(6), J.T @ error)
+            JtJ = J.T @ J
+            delta_q = np.linalg.solve(JtJ + damping * np.eye(6), J.T @ error)
 
             # Adaptive step size
             max_step = 0.3 if pos_error > 0.1 else (0.2 if pos_error > 0.05 else 0.1)
-            norm     = np.linalg.norm(delta_q)
+            norm = np.linalg.norm(delta_q)
             if norm > max_step:
                 delta_q *= max_step / norm
 
@@ -241,21 +221,18 @@ class Kinematics:
         rospy.logwarn("  Did not converge. Final error: %.2f mm", pos_error * 1000)
         return q, success
 
-    # ------------------------------------------------------------------
-    # Natural-posture IK (multi-seed + plausibility check, no frozen joints)
-    # ------------------------------------------------------------------
-
+    # Natural-posture IK (multi-seed + plausibility check)
     def _shoulder_is_natural(self, q):
-        """True if the shoulder (joint 2) is in an upright, non-folded range.
-        The folded-back solutions that make the arm crank into itself sit near
-        +/-180 deg; a natural top-down posture has the shoulder around -90 deg."""
+        """
+        True if the shoulder (joint 2) is in an upright, non-folded range.
+        """
         s = (q[1] + np.pi) % (2 * np.pi) - np.pi      # wrap to [-pi, pi]
         return np.deg2rad(-150) < s < np.deg2rad(-30)
 
     def _wrist1_is_free(self, q):
-        """True if wrist_1 is on the collision-free side. Confirmed in
-        simulation: the free branch has wrist_1 on the NEGATIVE side
-        (around -90 deg); the +90 deg branch drives the flange into the arm."""
+        """
+        True if wrist_1 is on the collision-free side. Confirmed in simulation
+        """
         w1 = (q[3] + np.pi) % (2 * np.pi) - np.pi     # wrap to [-pi, pi]
         return np.deg2rad(-160) < w1 < np.deg2rad(-10)
 
@@ -276,12 +253,8 @@ class Kinematics:
                          joint_names, robot, max_iterations=500, tolerance=5e-3):
         """
         Solve IK preferring a natural, upright arm posture with the wrist on the
-        collision-free side, WITHOUT freezing any joint. For each candidate seed
-        it solves IK; if the shoulder is natural but wrist_1 is on the colliding
-        side, it re-seeds from the flipped wrist branch and re-solves (so the TCP
-        is re-converged onto the target, not just rotated). Returns the first
-        solution that is both shoulder-natural and wrist-free; otherwise the best
-        converged solution so the sequence still completes.
+        collision-free side. Returns the first solution that is both shoulder-natural and wrist-free; 
+        otherwise the best converged solution so the sequence still completes.
         """
         b  = primary_seed[0]   # keep base (target direction) from the chained seed
         w2 = primary_seed[4]   # keep wrist2 (gripper pointing down)
@@ -308,7 +281,7 @@ class Kinematics:
             if self._solution_ok(q):
                 return q, True
 
-            # Shoulder natural but wrist on the wrong side? Re-solve from the
+            # Shoulder natural but wrist on the wrong side: Re-solve from the
             # flipped wrist branch so the flange clears the arm.
             if self._shoulder_is_natural(q) and not self._wrist1_is_free(q):
                 q2, ok2 = self.inverse_kinematics(target_pos, target_rot,
@@ -319,7 +292,7 @@ class Kinematics:
                     return q2, True
 
             if fallback is None:
-                fallback = q   # remember a converged (but not ideal) solution
+                fallback = q   # remember a converged but not ideal solution
 
         if fallback is not None:
             rospy.logwarn("  No natural+wrist-free solution found — using best "
@@ -327,15 +300,11 @@ class Kinematics:
             return fallback, True
         return q, False
 
-    # ------------------------------------------------------------------
     # Angle unwrapping — shortest path from seed
-    # ------------------------------------------------------------------
-
     def _unwrap_to_seed(self, q, q_seed):
         """
         For each joint, shift by the nearest multiple of 2pi so the result
-        stays as close as possible to q_seed.  This prevents unnecessary
-        full rotations (e.g. wrist flipping 340 degrees instead of 20).
+        stays as close as possible to q_seed.
         """
         q_out = q.copy()
         for i in range(len(q)):
@@ -343,37 +312,30 @@ class Kinematics:
             q_out[i] = q[i] - np.round(diff / (2 * np.pi)) * (2 * np.pi)
         return q_out
 
-    # ------------------------------------------------------------------
     # Error function (6D: position + rotation vector)
-    # ------------------------------------------------------------------
-
     def _compute_error(self, T, target_pos, target_rot):
         pos_err = T[:3, 3] - target_pos
         ist_rot = Rotation.from_matrix(T[:3, :3])
         rot_err = (target_rot * ist_rot.inv()).as_rotvec()
         return np.concatenate([pos_err, rot_err])
 
-    # ------------------------------------------------------------------
     # Numerical Jacobian
-    # ------------------------------------------------------------------
-
     def _numerical_jacobian(self, q, target_pos, target_rot, joint_names, robot, eps=1e-4):
-        J       = np.zeros((6, 6))
-        T0      = self.calculate_forward_kinematics(q, joint_names, robot)
+        J = np.zeros((6, 6))
+        T0 = self.calculate_forward_kinematics(q, joint_names, robot)
         error0  = self._compute_error(T0, target_pos, target_rot)
 
         for i in range(6):
-            q_d       = q.copy()
-            q_d[i]   += eps
-            T_d       = self.calculate_forward_kinematics(q_d, joint_names, robot)
-            error_d   = self._compute_error(T_d, target_pos, target_rot)
-            J[:, i]   = (error_d - error0) / eps
+            q_d = q.copy()
+            q_d[i] += eps
+            T_d = self.calculate_forward_kinematics(q_d, joint_names, robot)
+            error_d = self._compute_error(T_d, target_pos, target_rot)
+            J[:, i] = (error_d - error0) / eps
 
         return J
 
-    # ------------------------------------------------------------------
+    
     # Matrix helpers
-    # ------------------------------------------------------------------
 
     def _transformation_matrix(self, xyz, rpy):
         roll, pitch, yaw = rpy
@@ -392,8 +354,8 @@ class Kinematics:
         return T
 
     def _rotation_matrix_axis_angle(self, axis, angle):
-        ax      = np.array(axis, dtype=float)
-        ax     /= np.linalg.norm(ax)
+        ax = np.array(axis, dtype=float)
+        ax /= np.linalg.norm(ax)
         x, y, z = ax
         c, s, t = math.cos(angle), math.sin(angle), 1 - math.cos(angle)
         T = np.eye(4)
@@ -402,9 +364,7 @@ class Kinematics:
                                [t*x*z-s*y, t*y*z+s*x, t*z*z+c  ]])
         return T
 
-    # ------------------------------------------------------------------
-    # ROS message helpers (unchanged from original)
-    # ------------------------------------------------------------------
+    # ROS message helpers
 
     def get_pose_message_from_matrix(self, matrix):
         ps = PoseStamped()
@@ -453,9 +413,7 @@ class Kinematics:
         return q
 
 
-# ----------------------------------------------------------------------
 # Standalone entry point
-# ----------------------------------------------------------------------
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Unified Pick and Place Kinematics')
