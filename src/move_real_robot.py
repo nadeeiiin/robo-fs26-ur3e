@@ -14,8 +14,6 @@ class RealRobotArm:
         port_ur = 30002
         port_gripper = 63352
 
-        # main_NF.py already calls rospy.init_node('pick_and_place'); calling
-        # init_node again with a different name raises a ROSException. Guard it.
         if not rospy.core.is_initialized():
             rospy.init_node('my_real_robot')
         rospy.sleep(3.0)        
@@ -24,6 +22,7 @@ class RealRobotArm:
         self.socket_ur.connect((host, port_ur))
         self.socket_gripper = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.socket_gripper.connect((host, port_gripper))
+        
         # activate the gripper — this triggers a one-time open/close calibration
         # cycle. Wait for it to finish before any further command races it.
         self.socket_gripper.sendall(b'SET ACT 1\n')
