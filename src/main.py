@@ -43,7 +43,7 @@ def main():
 
     robot = RealRobotArm()
 
-    # Begin: upright home -> safe start pose (largest swings, give them time)
+    # Begin: upright home -> safe start pose
     rospy.loginfo("0. Home (upright)"); robot.send_joint_command(waypoints['home']);          rospy.sleep(5.0)
     rospy.loginfo("1. Safe start");     robot.send_joint_command(waypoints['start']);         rospy.sleep(5.0)
 
